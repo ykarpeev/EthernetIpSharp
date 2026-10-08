@@ -19,6 +19,10 @@ public static class TagServices
     public const byte WriteTagFragmented = 0x53;
 
     private const int MaxReplyData = 480; // ~500 bytes minus overhead
+    private const ushort StructTypeIndicator = 0x02A0; // A0 02 on the wire
+
+    private static int GetReadTypePrefixLength(Tag tag) =>
+        LogixDataTypes.IsStruct(tag.SymbolType) ? 4 : 2;
 
     /// <summary>
     /// Read Tag Service (0x4C).
@@ -40,12 +44,13 @@ public static class TagServices
         if (byteOffset + bytesToRead > tag.DataSize)
             return CipServiceResponse.Error(serviceCode, CipStatus.Error(0xFF, 0x2105));
 
-        int responseLen = 2 + bytesToRead;
+        int typePrefixLen = GetReadTypePrefixLength(tag);
+        int responseLen = typePrefixLen + bytesToRead;
 
         // Check if data fits in reply
         if (responseLen > MaxReplyData)
         {
-            int fitBytes = MaxReplyData - 2;
+            int fitBytes = MaxReplyData - typePrefixLen;
             return BuildReadResponse(tag, serviceCode, byteOffset, fitBytes, isPartial: true);
         }
 
@@ -88,24 +93,39 @@ public static class TagServices
     /// Request: element_count (UINT) + byte_offset (UDINT)
     /// Reply: tag_type (UINT) + data bytes (status 0x06 if more data remains)
     /// </summary>
-    public static CipServiceResponse HandleReadTagFragmented(Tag tag, byte serviceCode, ReadOnlyMemory<byte> data)
+    public static CipServiceResponse HandleReadTagFragmented(
+        Tag tag,
+        byte serviceCode,
+        ReadOnlyMemory<byte> data,
+        int elementOffset = 0)
     {
         if (data.Length < 6)
             return CipServiceResponse.Error(serviceCode, CipStatus.Error(0x13));
+        if (elementOffset < 0)
+            return CipServiceResponse.Error(serviceCode, CipStatus.Error(0xFF, 0x2105));
 
         var span = data.Span;
         ushort elementCount = BinaryPrimitives.ReadUInt16LittleEndian(span);
-        uint byteOffset = BinaryPrimitives.ReadUInt32LittleEndian(span.Slice(2));
+        uint fragmentOffset = BinaryPrimitives.ReadUInt32LittleEndian(span.Slice(2));
 
+        if (elementCount == 0)
+            elementCount = 1;
+
+        int elementBaseOffset = elementOffset * tag.ElementSize;
         int totalBytes = elementCount * tag.ElementSize;
-        if (byteOffset >= (uint)totalBytes)
+
+        if (elementBaseOffset < 0 || elementBaseOffset + totalBytes > tag.DataSize)
+            return CipServiceResponse.Error(serviceCode, CipStatus.Error(0xFF, 0x2105));
+        if (fragmentOffset >= (uint)totalBytes)
             return CipServiceResponse.Error(serviceCode, CipStatus.Error(0xFF, 0x2105));
 
-        int remaining = totalBytes - (int)byteOffset;
-        int chunkSize = Math.Min(remaining, MaxReplyData - 2);
-        bool moreData = (int)byteOffset + chunkSize < totalBytes;
+        int remaining = totalBytes - (int)fragmentOffset;
+        int typePrefixLen = GetReadTypePrefixLength(tag);
+        int chunkSize = Math.Min(remaining, MaxReplyData - typePrefixLen);
+        int byteOffset = elementBaseOffset + (int)fragmentOffset;
+        bool moreData = (int)fragmentOffset + chunkSize < totalBytes;
 
-        return BuildReadResponse(tag, serviceCode, (int)byteOffset, chunkSize, isPartial: moreData);
+        return BuildReadResponse(tag, serviceCode, byteOffset, chunkSize, isPartial: moreData);
     }
 
     /// <summary>
@@ -183,12 +203,24 @@ public static class TagServices
     private static CipServiceResponse BuildReadResponse(Tag tag, byte serviceCode,
         int byteOffset, int dataLength, bool isPartial)
     {
-        int responseLen = 2 + dataLength;
+        bool isStruct = LogixDataTypes.IsStruct(tag.SymbolType);
+        int typePrefixLen = isStruct ? 4 : 2;
+        int responseLen = typePrefixLen + dataLength;
+
         var rented = ArrayPool<byte>.Shared.Rent(responseLen);
         try
         {
-            BinaryPrimitives.WriteUInt16LittleEndian(rented, tag.TagType);
-            tag.GetData(byteOffset, dataLength).CopyTo(rented.AsSpan(2));
+            if (isStruct)
+            {
+                BinaryPrimitives.WriteUInt16LittleEndian(rented, StructTypeIndicator);
+                BinaryPrimitives.WriteUInt16LittleEndian(rented.AsSpan(2), tag.TagType);
+            }
+            else
+            {
+                BinaryPrimitives.WriteUInt16LittleEndian(rented, tag.TagType);
+            }
+
+            tag.GetData(byteOffset, dataLength).CopyTo(rented.AsSpan(typePrefixLen));
 
             // Copy to exact-sized array for the response (ArrayPool may over-allocate)
             var result = rented.AsSpan(0, responseLen).ToArray();
