@@ -65,26 +65,48 @@ public static class TagServices
     public static CipServiceResponse HandleWriteTag(Tag tag, byte serviceCode, ReadOnlyMemory<byte> data,
         int elementOffset = 0)
     {
-        if (data.Length < 4)
-            return CipServiceResponse.Error(serviceCode, CipStatus.Error(0x13));
-
         var span = data.Span;
-        ushort tagType = BinaryPrimitives.ReadUInt16LittleEndian(span);
-        ushort elementCount = BinaryPrimitives.ReadUInt16LittleEndian(span.Slice(2));
+        bool isStruct = LogixDataTypes.IsStruct(tag.SymbolType);
 
-        if (tagType != tag.TagType)
-            return CipServiceResponse.Error(serviceCode, CipStatus.Error(0xFF, 0x2107));
+        ushort elementCount;
+        int headerLen;
+
+        if (isStruct)
+        {
+            if (span.Length < 6)
+                return CipServiceResponse.Error(serviceCode, CipStatus.Error(0x13));
+
+            ushort structIndicator = BinaryPrimitives.ReadUInt16LittleEndian(span);
+            ushort structHandle = BinaryPrimitives.ReadUInt16LittleEndian(span.Slice(2));
+            elementCount = BinaryPrimitives.ReadUInt16LittleEndian(span.Slice(4));
+            headerLen = 6;
+
+            if (structIndicator != StructTypeIndicator || structHandle != tag.TagType)
+                return CipServiceResponse.Error(serviceCode, CipStatus.Error(0xFF, 0x2107));
+        }
+        else
+        {
+            if (span.Length < 4)
+                return CipServiceResponse.Error(serviceCode, CipStatus.Error(0x13));
+
+            ushort tagType = BinaryPrimitives.ReadUInt16LittleEndian(span);
+            elementCount = BinaryPrimitives.ReadUInt16LittleEndian(span.Slice(2));
+            headerLen = 4;
+
+            if (tagType != tag.TagType)
+                return CipServiceResponse.Error(serviceCode, CipStatus.Error(0xFF, 0x2107));
+        }
 
         int byteOffset = elementOffset * tag.ElementSize;
         int bytesToWrite = elementCount * tag.ElementSize;
-        if (data.Length < 4 + bytesToWrite)
+
+        if (span.Length < headerLen + bytesToWrite)
             return CipServiceResponse.Error(serviceCode, CipStatus.Error(0x13));
 
         if (byteOffset + bytesToWrite > tag.DataSize)
             return CipServiceResponse.Error(serviceCode, CipStatus.Error(0xFF, 0x2105));
 
-        tag.SetData(span.Slice(4, bytesToWrite), byteOffset);
-
+        tag.SetData(span.Slice(headerLen, bytesToWrite), byteOffset);
         return CipServiceResponse.Success(serviceCode);
     }
 
